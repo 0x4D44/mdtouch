@@ -1,7 +1,8 @@
 use std::env;
 use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::Path;
-use std::process;
+use std::process::ExitCode;
 
 use filetime::{set_file_times, FileTime};
 
@@ -16,8 +17,12 @@ const BUILD_DATETIME: &str = match option_env!("BUILD_DATETIME") {
 fn help_message() -> String {
     let mut msg = String::new();
     msg.push_str("Usage: mdtouch [OPTIONS] <file> [file...]\n\n");
-    msg.push_str("A command line tool to mimic the behaviour of the Unix touch command on Windows.\n");
-    msg.push_str("If the file does not exist, it will be created. Otherwise, its access and modification\n");
+    msg.push_str(
+        "A command line tool to mimic the behaviour of the Unix touch command on Windows.\n",
+    );
+    msg.push_str(
+        "If the file does not exist, it will be created. Otherwise, its access and modification\n",
+    );
     msg.push_str("times will be updated to the current time.\n\n");
     msg.push_str("Options:\n");
     msg.push_str("  -h, -?      Display this help message and exit.\n");
@@ -31,36 +36,64 @@ fn touch_file<P: AsRef<Path>>(path: P) -> std::io::Result<()> {
     let path = path.as_ref();
     if !path.exists() {
         // Create the file if it does not exist.
-        OpenOptions::new().create(true).write(true).open(path)?;
+        OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(path)?;
     }
     // Update the file's access and modification times to now.
     let now = FileTime::now();
     set_file_times(path, now, now)
 }
 
-fn main() {
-    let args: Vec<String> = env::args().skip(1).collect();
-
+/// Runs the application logic.
+///
+/// # Arguments
+///
+/// * `args` - A vector of command line arguments (excluding the program name).
+/// * `writer` - A mutable reference to a writer for standard output.
+fn run<W: Write>(args: Vec<String>, mut writer: W) -> std::io::Result<()> {
     // If no arguments are provided, print the version and a short summary.
     if args.is_empty() {
-        println!("mdtouch  {}", BUILD_DATETIME);
-        println!("A tool to update file timestamps or create empty files, mimicking the Unix touch command.");
-        return;
+        writeln!(writer, "mdtouch  {}", BUILD_DATETIME)?;
+        writeln!(
+            writer,
+            "A tool to update file timestamps or create empty files, mimicking the Unix touch command."
+        )?;
+        return Ok(());
     }
 
     // If any argument is a help flag, display help and exit.
     if args.iter().any(|arg| arg == "-h" || arg == "-?") {
-        println!("{}", help_message());
-        return;
+        writeln!(writer, "{}", help_message())?;
+        return Ok(());
     }
 
     // Process each file argument.
     for filename in args {
         if let Err(e) = touch_file(&filename) {
-            eprintln!("Error touching {}: {}", filename, e);
-            process::exit(1);
+            // In the main loop, we print to stderr usually, but here we propagate the error
+            // so main can handle it.
+            // However, to mimic the original behavior of printing "Error touching ...",
+            // we will format the error into a new Error.
+            return Err(std::io::Error::other(format!(
+                "Error touching {}: {}",
+                filename, e
+            )));
         }
     }
+    Ok(())
+}
+
+fn main() -> ExitCode {
+    let args: Vec<String> = env::args().skip(1).collect();
+
+    if let Err(e) = run(args, std::io::stdout()) {
+        eprintln!("{}", e);
+        return ExitCode::FAILURE;
+    }
+    ExitCode::SUCCESS
 }
 
 #[cfg(test)]
@@ -141,8 +174,74 @@ mod tests {
     #[test]
     fn test_help_message_contains_usage() {
         let help = help_message();
-        assert!(help.contains("Usage:"), "Help message should contain 'Usage:'");
-        assert!(help.contains("-h"), "Help message should mention '-h' option");
-        assert!(help.contains("-?"), "Help message should mention '-?' option");
+        assert!(
+            help.contains("Usage:"),
+            "Help message should contain 'Usage:'"
+        );
+        assert!(
+            help.contains("-h"),
+            "Help message should mention '-h' option"
+        );
+        assert!(
+            help.contains("-?"),
+            "Help message should mention '-?' option"
+        );
+    }
+
+    #[test]
+    fn test_run_no_args() {
+        let mut output = Vec::new();
+        let result = run(vec![], &mut output);
+        assert!(result.is_ok());
+        let output_str = String::from_utf8(output).unwrap();
+        assert!(output_str.contains("mdtouch"));
+        assert!(output_str.contains("A tool to update file timestamps"));
+    }
+
+    #[test]
+    fn test_run_help_arg() {
+        let mut output = Vec::new();
+        let result = run(vec!["-h".to_string()], &mut output);
+        assert!(result.is_ok());
+        let output_str = String::from_utf8(output).unwrap();
+        assert!(output_str.contains("Usage:"));
+    }
+
+    #[test]
+    fn test_run_touch_file() {
+        let path = unique_temp_file();
+        let path_str = path.to_str().unwrap().to_string();
+        let mut output = Vec::new();
+
+        let result = run(vec![path_str], &mut output);
+        assert!(result.is_ok());
+        assert!(path.exists());
+
+        // Cleanup
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn test_run_error_handling() {
+        // We use a directory path which cannot be created as a file
+        // path variable removed as it was unused
+        let mut output = Vec::new();
+
+        // Trying to 'touch' an existing directory typically updates its timestamp on Unix,
+        // but OpenOptions(...).create(true).write(true).open(dir) fails on Windows with "Access is denied"
+        // or "is a directory" depending on the OS.
+        // Let's force an error by using a path with a non-existent parent directory.
+        // E.g. temp_dir / "non_existent_dir" / "file.txt"
+
+        let mut bad_path = env::temp_dir();
+        bad_path.push("non_existent_dir_xyz_123");
+        bad_path.push("file.txt");
+
+        let bad_path_str = bad_path.to_str().unwrap().to_string();
+
+        let result = run(vec![bad_path_str], &mut output);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("Error touching"));
     }
 }
